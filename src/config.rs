@@ -57,6 +57,13 @@ lazy_static::lazy_static! {
     pub static ref ORG: RwLock<String> = RwLock::new("com.carriez".to_owned());
 }
 
+fn privacy_settings(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+    pairs
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect()
+}
+
 type Size = (i32, i32, i32, i32);
 type KeyPair = (Vec<u8>, Vec<u8>);
 
@@ -73,14 +80,31 @@ lazy_static::lazy_static! {
     static ref KEY_PAIR: Mutex<Option<KeyPair>> = Default::default();
     static ref USER_DEFAULT_CONFIG: RwLock<(UserDefaultConfig, Instant)> = RwLock::new((UserDefaultConfig::load(), Instant::now()));
     pub static ref NEW_STORED_PEER_CONFIG: Mutex<HashSet<String>> = Default::default();
-    pub static ref DEFAULT_SETTINGS: RwLock<HashMap<String, String>> = Default::default();
+    // MatrixConnections privacy-hardened defaults (user can still change them in Settings):
+    // no session recording, no LAN discovery, no trusted devices.
+    pub static ref DEFAULT_SETTINGS: RwLock<HashMap<String, String>> = RwLock::new(privacy_settings(&[
+        ("enable-record-session", "N"),
+        ("allow-auto-record-incoming", "N"),
+        ("enable-lan-discovery", "N"),
+        ("enable-trusted-devices", "N"),
+    ]));
     pub static ref OVERWRITE_SETTINGS: RwLock<HashMap<String, String>> = Default::default();
     pub static ref DEFAULT_DISPLAY_SETTINGS: RwLock<HashMap<String, String>> = Default::default();
     pub static ref OVERWRITE_DISPLAY_SETTINGS: RwLock<HashMap<String, String>> = Default::default();
-    pub static ref DEFAULT_LOCAL_SETTINGS: RwLock<HashMap<String, String>> = Default::default();
+    // MatrixConnections privacy-hardened local defaults: no auto-recording of outgoing sessions,
+    // Record button hidden, LAN "Discovered" panel (which caches nearby hosts on disk) hidden.
+    pub static ref DEFAULT_LOCAL_SETTINGS: RwLock<HashMap<String, String>> = RwLock::new(privacy_settings(&[
+        ("allow-auto-record-outgoing", "N"),
+        ("hide-recording-button", "Y"),
+        ("disable-discovery-panel", "Y"),
+    ]));
     pub static ref OVERWRITE_LOCAL_SETTINGS: RwLock<HashMap<String, String>> = Default::default();
     pub static ref HARD_SETTINGS: RwLock<HashMap<String, String>> = Default::default();
-    pub static ref BUILTIN_SETTINGS: RwLock<HashMap<String, String>> = Default::default();
+    // MatrixConnections: "register-device=N" disables the account/API-server code path entirely
+    // (heartbeat, sysinfo upload, connection and file-transfer audit posts to :21114).
+    pub static ref BUILTIN_SETTINGS: RwLock<HashMap<String, String>> = RwLock::new(privacy_settings(&[
+        ("register-device", "N"),
+    ]));
 }
 
 #[cfg(target_os = "android")]
@@ -2173,17 +2197,19 @@ impl LocalConfig {
         config.store();
     }
 
-    pub fn set_remote_id(remote_id: &str) {
+    // MatrixConnections privacy hardening: the last used peer ID is never persisted.
+    // Any value left by an older build is wiped the next time this is called.
+    pub fn set_remote_id(_remote_id: &str) {
         let mut config = LOCAL_CONFIG.write().unwrap();
-        if remote_id == config.remote_id {
+        if config.remote_id.is_empty() {
             return;
         }
-        config.remote_id = remote_id.into();
+        config.remote_id = String::new();
         config.store();
     }
 
     pub fn get_remote_id() -> String {
-        LOCAL_CONFIG.read().unwrap().remote_id.clone()
+        String::new()
     }
 
     pub fn set_fav(fav: Vec<String>) {

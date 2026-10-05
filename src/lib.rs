@@ -424,6 +424,100 @@ pub fn is_domain_port_str(id: &str) -> bool {
     }
 }
 
+lazy_static::lazy_static! {
+    // MatrixConnections privacy hardening: patterns scrubbed from every log line before it is
+    // written to disk. Paths are handled before IPs because they may contain dotted numbers.
+    static ref LOG_WIN_PATH: regex::Regex =
+        regex::Regex::new(r#"(?i)\b[a-z]:[\\/][^"'<>|*?\r\n:,\)\]]*"#).unwrap();
+    static ref LOG_UNC_PATH: regex::Regex =
+        regex::Regex::new(r#"\\\\[^\\\s"'<>|*?:,\)\]]+\\[^"'<>|*?\r\n:,\)\]]*"#).unwrap();
+    static ref LOG_UNIX_PATH: regex::Regex =
+        regex::Regex::new(r#"(^|[\s"'(=\[])/[^\s/"'<>:]+(?:/[^\s"'<>:,;\]\)]*)+"#).unwrap();
+    static ref LOG_IPV4: regex::Regex =
+        regex::Regex::new(r#"\b(?:\d{1,3}\.){3}\d{1,3}(?::\d{1,5})?\b"#).unwrap();
+    static ref LOG_IPV6_CANDIDATE: regex::Regex =
+        regex::Regex::new(r#"\[?[0-9A-Fa-f]{0,4}:[0-9A-Fa-f:]*:[0-9A-Fa-f.]*(?:%[0-9A-Za-z]+)?\]?(?::\d{1,5})?"#).unwrap();
+}
+
+fn looks_like_ipv6(candidate: &str) -> bool {
+    let mut s = candidate;
+    if let Some(rest) = s.strip_prefix('[') {
+        // [addr] or [addr]:port
+        s = match rest.find(']') {
+            Some(i) => &rest[..i],
+            None => rest,
+        };
+    }
+    let s = s.split('%').next().unwrap_or(s);
+    if s.parse::<std::net::Ipv6Addr>().is_ok() {
+        return true;
+    }
+    // addr:port without brackets (ambiguous) - try dropping the last component
+    if let Some(i) = s.rfind(':') {
+        if s[..i].parse::<std::net::Ipv6Addr>().is_ok() && s[..i].contains("::") {
+            return true;
+        }
+    }
+    false
+}
+
+/// Remove IP addresses and file system paths from a log message.
+pub fn redact_log_message(msg: &str) -> String {
+    let mut out = std::borrow::Cow::Borrowed(msg);
+    if LOG_WIN_PATH.is_match(&out) {
+        out = std::borrow::Cow::Owned(LOG_WIN_PATH.replace_all(&out, "<path>").into_owned());
+    }
+    if LOG_UNC_PATH.is_match(&out) {
+        out = std::borrow::Cow::Owned(LOG_UNC_PATH.replace_all(&out, "<path>").into_owned());
+    }
+    if LOG_UNIX_PATH.is_match(&out) {
+        out = std::borrow::Cow::Owned(
+            LOG_UNIX_PATH.replace_all(&out, "${1}<path>").into_owned(),
+        );
+    }
+    if LOG_IPV6_CANDIDATE.is_match(&out) {
+        let hay: String = out.into_owned();
+        let is_word = |c: Option<char>| c.map_or(false, |c| c.is_alphanumeric() || c == '_');
+        let replaced = LOG_IPV6_CANDIDATE
+            .replace_all(&hay, |caps: &regex::Captures| {
+                let m = caps.get(0).unwrap();
+                let before = hay[..m.start()].chars().last();
+                let after = hay[m.end()..].chars().next();
+                // `std::io::Error`, `a::b` etc. are Rust paths, not addresses
+                if !is_word(before) && !is_word(after) && looks_like_ipv6(m.as_str()) {
+                    "<ip>".to_owned()
+                } else {
+                    m.as_str().to_owned()
+                }
+            })
+            .into_owned();
+        out = std::borrow::Cow::Owned(replaced);
+    }
+    if LOG_IPV4.is_match(&out) {
+        out = std::borrow::Cow::Owned(LOG_IPV4.replace_all(&out, "<ip>").into_owned());
+    }
+    out.into_owned()
+}
+
+#[cfg(not(debug_assertions))]
+fn privacy_log_format(
+    w: &mut dyn std::io::Write,
+    now: &mut flexi_logger::DeferredNow,
+    record: &log::Record,
+) -> Result<(), std::io::Error> {
+    #[allow(unused_imports)]
+    use std::io::Write as _;
+    write!(
+        w,
+        "[{}] {} [{}:{}] {}",
+        now.format("%Y-%m-%d %H:%M:%S%.6f"),
+        record.level(),
+        record.file().unwrap_or("<unnamed>"),
+        record.line().unwrap_or(0),
+        redact_log_message(&record.args().to_string())
+    )
+}
+
 pub fn init_log(_is_async: bool, _name: &str) -> Option<flexi_logger::LoggerHandle> {
     static INIT: std::sync::Once = std::sync::Once::new();
     #[allow(unused_mut)]
@@ -452,7 +546,10 @@ pub fn init_log(_is_async: bool, _name: &str) -> Option<flexi_logger::LoggerHand
                 path.push(_name);
             }
             use flexi_logger::*;
-            if let Ok(x) = Logger::try_with_env_or_str("debug,reqwest=warn,hyper_util=warn,rustls=warn,webrtc-sctp=warn,webrtc=warn,webrtc_ice::agent::agent_internal=error,webrtc::peer_connection=error") {
+            // MatrixConnections privacy hardening: only warnings and errors reach the log files
+            // (upstream logs at "debug", which records peer IPs, IDs and transferred file paths).
+            // RUST_LOG still overrides this for deliberate troubleshooting.
+            if let Ok(x) = Logger::try_with_env_or_str("warn,webrtc_ice::agent::agent_internal=error,webrtc::peer_connection=error") {
                 logger_holder = x
                     .log_to_file(FileSpec::default().directory(path))
                     .write_mode(if _is_async {
@@ -460,7 +557,7 @@ pub fn init_log(_is_async: bool, _name: &str) -> Option<flexi_logger::LoggerHand
                     } else {
                         WriteMode::Direct
                     })
-                    .format(opt_format)
+                    .format(privacy_log_format)
                     .rotate(
                         // Size as well as age: rotating only daily lets one day's file grow
                         // without limit, so whoever can drive a hot log site — a peer sending
@@ -474,7 +571,9 @@ pub fn init_log(_is_async: bool, _name: &str) -> Option<flexi_logger::LoggerHand
                         // (a count cannot outrun a flood; only the rate limits at the log sites
                         // can) at the price of multiplying steady-state retention and disk for
                         // everyone.
-                        Cleanup::KeepLogFiles(90),
+                        // MatrixConnections: keep at most 3 rotated files (upstream keeps 90,
+                        // i.e. ~90 days of history).
+                        Cleanup::KeepLogFiles(3),
                     )
                     .start()
                     .ok();
@@ -644,5 +743,29 @@ mod test {
         assert_eq!(get_version_number("1.1.10-1"), 1001101);
         assert_eq!(get_version_number("1.1.11-1"), 1001111);
         assert_eq!(get_version_number("1.2.3"), 1002030);
+    }
+}
+
+#[cfg(test)]
+mod privacy_log_tests {
+    use super::redact_log_message as r;
+
+    #[test]
+    fn redacts_ips_and_paths() {
+        assert_eq!(r("Connection opened from 192.168.1.20:51234"), "Connection opened from <ip>");
+        assert_eq!(r("peer [2001:db8::1]:21116 closed"), "peer <ip> closed");
+        assert_eq!(r("from fe80::1%12 ok"), "from <ip> ok");
+        assert_eq!(r("from ::ffff:10.0.0.1 ok"), "from <ip> ok");
+        assert_eq!(
+            r(r"Failed to open C:\Users\John Doe\Documents\secret plan.docx: Access denied"),
+            "Failed to open <path>: Access denied"
+        );
+        assert_eq!(r(r"write \\nas\share\a b.txt, done"), "write <path>, done");
+        assert_eq!(r("remote \"/home/alice/tax.pdf\" missing"), "remote \"<path>\" missing");
+        // Things that must be left alone
+        assert_eq!(r("hbb_common::config::Config error"), "hbb_common::config::Config error");
+        assert_eq!(r("std::io::Error at 12:34:56"), "std::io::Error at 12:34:56");
+        assert_eq!(r("version 1.5.0 started"), "version 1.5.0 started");
+        assert_eq!(r("url http://host/api/heartbeat"), "url http://host/api/heartbeat");
     }
 }
